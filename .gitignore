@@ -1,0 +1,10 @@
+__pycache__
+*.egg-info
+.DS_Store
+wan_models
+checkpoints
+logs
+videos
+prompts
+visual-output
+visual-output-id

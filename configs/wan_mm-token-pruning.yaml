@@ -1,0 +1,95 @@
+generator_ckpt: <CKPT_FROM_STAGE2>
+generator_fsdp_wrap_strategy: size
+real_score_fsdp_wrap_strategy: size
+fake_score_fsdp_wrap_strategy: size
+real_ckpt: <CKPT_FROM_STAGE1>
+fake_ckpt: <CKPT_FROM_STAGE1>
+text_encoder_fsdp_wrap_strategy: size
+denoising_step_list:
+- 1000
+- 750
+- 500
+- 250
+warp_denoising_step: true
+ts_schedule: false
+num_train_timestep: 1000
+timestep_shift: 5.0
+guidance_scale: 3.0
+denoising_loss_type: flow
+mixed_precision: true
+seed: 0
+v2v: true
+
+sharding_strategy: hybrid_full
+lr: 2.0e-06
+lr_critic: 4.0e-07
+beta1: 0.0
+beta2: 0.999
+beta1_critic: 0.0
+beta2_critic: 0.999
+data_path: <YOUR_DATA_PATH>
+batch_size: 1
+ema_weight: 0.99
+ema_start_step: 200
+total_batch_size: 8
+log_iters: 50
+negative_prompt: '色调艳丽，过曝，静态，细节模糊不清，字幕，风格，作品，画作，画面，静止，整体发灰，最差质量，低质量，JPEG压缩残留，丑陋的，残缺的，多余的手指，画得不好的手部，画得不好的脸部，畸形的，毁容的，形态畸形的肢体，手指融合，静止不动的画面，杂乱的背景，三条腿，背景人很多，倒着走'
+dfake_gen_update_ratio: 5
+image_or_video_shape:
+- 1
+- 21
+- 16
+- 60
+- 104
+distribution_loss: mm_dmd
+trainer: score_distillation
+gradient_checkpointing: true
+num_frame_per_block: 3
+real_score_num_frame_per_block: 21
+fake_score_num_frame_per_block: 21
+load_raw_video: false
+num_frames: 81
+model_kwargs:
+  timestep_shift: 5.0
+
+
+use_history_guided_pruning: true
+use_internal_pruning: true  
+
+# Internal Pruning层级控制
+internal_pruning_layers: ["self_attn"]  # 可选值: "self_attn", "ffn"
+
+# 均值对齐（Mean Alignment）
+use_mean_alignment: false  # 启用均值对齐
+                           # 在填充discarded位置前，对齐pruned delta与prev_step delta的均值
+
+# First Chunk缓存策略
+first_chunk_cache_item: "delta"  # 缓存内容选项: "x" 或 "delta"
+
+# 未Pruning位置的填充策略
+unpruned_fill_strategy: "prev_step"  # 填充策略
+                                     # "identity": delta=0，保持当前x不变
+                                     # "prev_step": 使用前一个全量计算step的delta（推荐）
+                                     # "first_chunk": 使用first chunk的值
+                                     # "source_latent": 使用source_latent (y_input)
+                                     # "interpolate": 从周围保留token插值
+                                     # "avg_delta": 使用保留token的平均delta
+                                     # "zero": 填充0
+
+# Step-wise Pruning控制
+internal_pruning_steps: [1,2]  # 在哪些denoising step进行pruning
+                              # null: 所有step都pruning
+                              # [1, 2]: 只在step 1和2进行pruning
+
+# Importance判断方式
+adaptive_patch_ratio: 0.3  # 保留比例（例如0.3表示保留top30%重要区域）
+
+# Mask可视化
+save_mask: False  # 保存importance mask为黑白视频
+mask_output_folder: "videos/masks"  # mask视频输出文件夹
+
+wandb_host: https://api.wandb.ai
+wandb_key: WANDB_KEY
+wandb_entity: WANDB_ENTITY
+wandb_project: WANDB_PROJECT
+wandb_name: WANDB_NAME
