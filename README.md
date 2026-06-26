@@ -9,6 +9,7 @@ Xinyu Wang<sup>1</sup>, Chongbo Zhao<sup>1</sup>, Fangneng Zhan<sup>2</sup>, Yue
 
 <strong>Accepted by ECCV 2026</strong>
 
+<a href='https://arxiv.org/abs/2606.26740'><img src='https://img.shields.io/badge/ArXiv-2606.26740-red'></a> 
 <a href="https://live-edit.github.io"><img src="https://img.shields.io/badge/Project-Page-green"></a>
 <a href="https://huggingface.co/cp-cp/LiveEdit/tree/main"><img src="https://img.shields.io/badge/HuggingFace-Checkpoints-yellow"></a>
 <img src="https://img.shields.io/badge/Task-Streaming%20Video%20Editing-blue">
