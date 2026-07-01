@@ -172,11 +172,10 @@ This repository builds on [Self-Forcing](https://github.com/guandeh17/Self-Forci
 If you find this project useful for your research, please cite:
 
 ```bibtex
-@inproceedings{wang2026liveedit,
+@article{wang2026liveedit,
   title={LiveEdit: Towards Real-Time Diffusion-Based Streaming Video Editing},
   author={Wang, Xinyu and Zhao, Chongbo and Zhan, Fangneng and Ma, Yue},
-  booktitle={European Conference on Computer Vision},
+  journal={arXiv preprint arXiv:2606.26740},
   year={2026}
-  organization={Springer}
 }
 ```
