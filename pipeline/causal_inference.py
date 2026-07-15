@@ -72,6 +72,37 @@ class CausalInferencePipeline(torch.nn.Module):
         self.prev_chunk_mask = None
         self.prev_chunk_generated_latent = None
         self.prev_chunk_importance_mask_1d = None  # 用于internal pruning的1D mask
+
+        # Training-free Predict-and-Perturb (P&P) refinement.
+        # Step indices are zero-based indices into denoising_step_list.
+        self.use_self_refine = getattr(args, "use_self_refine", False)
+        self.self_refine_steps = set(getattr(args, "self_refine_steps", [1]))
+        self.self_refine_iterations = int(getattr(args, "self_refine_iterations", 1))
+        self.self_refine_uncertainty_threshold = float(
+            getattr(args, "self_refine_uncertainty_threshold", 0.0)
+        )
+        self.self_refine_certain_percentage = float(
+            getattr(args, "self_refine_certain_percentage", 0.999)
+        )
+        self.self_refine_seed = int(
+            getattr(args, "self_refine_seed", getattr(args, "seed", 0) + 1_000_003)
+        )
+        self._self_refine_inference_index = 0
+
+        if self.self_refine_iterations < 1:
+            raise ValueError("self_refine_iterations must be at least 1")
+        if not 0.0 <= self.self_refine_certain_percentage <= 1.0:
+            raise ValueError("self_refine_certain_percentage must be in [0, 1]")
+        invalid_self_refine_steps = [
+            step for step in self.self_refine_steps
+            if step < 0 or step >= len(self.denoising_step_list) - 1
+        ]
+        if invalid_self_refine_steps:
+            raise ValueError(
+                "self_refine_steps must reference non-final denoising steps; "
+                f"got invalid indices {invalid_self_refine_steps} for "
+                f"{len(self.denoising_step_list)} denoising steps"
+            )
         
         # Mask可视化
         self.save_mask = getattr(args, "save_mask", False)
@@ -96,6 +127,20 @@ class CausalInferencePipeline(torch.nn.Module):
             self.generator.model.first_chunk_cache_item = self.first_chunk_cache_item
             self.generator.model.unpruned_fill_strategy = self.unpruned_fill_strategy
             self.generator.model.use_mean_alignment = self.use_mean_alignment
+
+        if self.use_self_refine:
+            print(
+                "Self-refining P&P enabled: "
+                f"steps={sorted(self.self_refine_steps)}, "
+                f"iterations={self.self_refine_iterations}, "
+                f"uncertainty_threshold={self.self_refine_uncertainty_threshold}"
+            )
+            if self.use_internal_pruning:
+                print(
+                    "WARNING: token pruning is enabled together with self-refining. "
+                    "P&P re-evaluations will use full tokens so pruning error does not "
+                    "contaminate the uncertainty estimate."
+                )
 
         if self.num_frame_per_block > 1:
             self.generator.model.num_frame_per_block = self.num_frame_per_block
@@ -407,6 +452,13 @@ class CausalInferencePipeline(torch.nn.Module):
         # 🆕 记录总生成时间
         import time
         generation_start_time = time.time()
+        pnp_generator = None
+        if self.use_self_refine:
+            pnp_generator = torch.Generator(device=noise.device)
+            pnp_generator.manual_seed(
+                self.self_refine_seed + self._self_refine_inference_index
+            )
+            self._self_refine_inference_index += 1
         for frame_idx, current_num_frames in enumerate(all_num_frames):
             debug_dict["current_chunk"] = frame_idx
             # print(f"[DEBUG] Processing chunk {frame_idx} with {current_num_frames} frames...")
@@ -520,6 +572,75 @@ class CausalInferencePipeline(torch.nn.Module):
                         kept_indices_per_frame=kept_indices_per_frame,
                         use_pruning=use_pruning_this_step,
                     )
+
+                    # Predict-and-Perturb at the same noise level. A dedicated
+                    # RNG keeps the baseline scheduler noise unchanged, making
+                    # seed-matched ablations meaningful.
+                    if self.use_self_refine and index in self.self_refine_steps:
+                        refined_pred = denoised_pred
+                        certain_mask = None
+
+                        for refine_index in range(self.self_refine_iterations):
+                            refine_noise = torch.randn(
+                                refined_pred.shape,
+                                generator=pnp_generator,
+                                device=refined_pred.device,
+                                dtype=refined_pred.dtype,
+                            )
+                            refine_input = self.scheduler.add_noise(
+                                refined_pred.flatten(0, 1),
+                                refine_noise.flatten(0, 1),
+                                timestep.flatten(0, 1),
+                            ).unflatten(0, refined_pred.shape[:2])
+
+                            _, new_pred = self.generator(
+                                noisy_image_or_video=refine_input,
+                                conditional_dict=conditional_dict,
+                                timestep=timestep,
+                                kv_cache=self.kv_cache1,
+                                crossattn_cache=self.crossattn_cache,
+                                current_start=current_start_frame * self.frame_seq_length,
+                                debug_dict=debug_dict,
+                                y=y_input,
+                                importance_mask=None,
+                                kept_indices_per_frame=None,
+                                use_pruning=False,
+                            )
+
+                            uncertainty = (new_pred - refined_pred).abs().mean(dim=2)
+                            threshold = self.self_refine_uncertainty_threshold
+
+                            if threshold > 0:
+                                current_certain = uncertainty < threshold
+                                certain_mask = (
+                                    current_certain
+                                    if certain_mask is None
+                                    else (certain_mask | current_certain)
+                                )
+                                certain_mask_5d = certain_mask.unsqueeze(2)
+                                refined_pred = torch.where(
+                                    certain_mask_5d, refined_pred, new_pred
+                                )
+                                certain_ratio = certain_mask.float().mean().item()
+                            else:
+                                refined_pred = new_pred
+                                certain_ratio = 0.0
+
+                            print(
+                                f"[Self-Refine][Chunk {frame_idx}][Step {index}] "
+                                f"iteration={refine_index + 1}/{self.self_refine_iterations}, "
+                                f"mean_uncertainty={uncertainty.mean().item():.6f}, "
+                                f"certain_ratio={certain_ratio:.4f}"
+                            )
+
+                            if (
+                                threshold > 0
+                                and certain_ratio > self.self_refine_certain_percentage
+                            ):
+                                break
+
+                        denoised_pred = refined_pred
+
                     next_timestep = self.denoising_step_list[index + 1]
                     noisy_input = self.scheduler.add_noise(
                         denoised_pred.flatten(0, 1),
