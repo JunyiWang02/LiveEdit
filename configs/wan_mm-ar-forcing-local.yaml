@@ -52,6 +52,9 @@ num_frames: 81
 model_kwargs:
   timestep_shift: 5.0
 
+# Baseline setting: retain the original LiveEdit inference path. The
+# self-refining implementation is opt-in so this config is valid for ablations.
+use_self_refine: false
 
 wandb_host: https://api.wandb.ai
 wandb_key: WANDB_KEY
