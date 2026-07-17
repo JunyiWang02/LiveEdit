@@ -1,5 +1,6 @@
 from typing import List, Optional
 import torch
+import torch.nn.functional as nnf
 import os
 
 from utils.wan_wrapper import WanDiffusionWrapper, WanTextEncoder, WanVAEWrapper
@@ -87,12 +88,73 @@ class CausalInferencePipeline(torch.nn.Module):
         self.self_refine_seed = int(
             getattr(args, "self_refine_seed", getattr(args, "seed", 0) + 1_000_003)
         )
+
+        # ``legacy`` reproduces the original whole-region P&P rule.  ``semantic``
+        # is a training-free, source-aware variant: it derives a soft edit mask
+        # from the model's own latent delta, smooths it in time, and only accepts
+        # perturbation updates that do not erase the current edit.
+        self.self_refine_strategy = str(
+            getattr(args, "self_refine_strategy", "semantic")
+        ).lower()
+        self.self_refine_edit_quantile = float(
+            getattr(args, "self_refine_edit_quantile", 0.70)
+        )
+        self.self_refine_dynamic_strength = float(
+            getattr(args, "self_refine_dynamic_strength", 0.65)
+        )
+        self.self_refine_edit_strength = float(
+            getattr(args, "self_refine_edit_strength", 1.0)
+        )
+        self.self_refine_exploration_strength = float(
+            getattr(args, "self_refine_exploration_strength", 0.10)
+        )
+        self.self_refine_source_anchor_strength = float(
+            getattr(args, "self_refine_source_anchor_strength", 0.08)
+        )
+        self.self_refine_mask_momentum = float(
+            getattr(args, "self_refine_mask_momentum", 0.70)
+        )
+        self.self_refine_temporal_smoothing = float(
+            getattr(args, "self_refine_temporal_smoothing", 0.50)
+        )
+        self.self_refine_mask_temperature = float(
+            getattr(args, "self_refine_mask_temperature", 0.10)
+        )
+        self.self_refine_acceptance_mode = str(
+            getattr(args, "self_refine_acceptance_mode", "preserve_edit")
+        ).lower()
+        self.self_refine_acceptance_margin = float(
+            getattr(args, "self_refine_acceptance_margin", 0.05)
+        )
         self._self_refine_inference_index = 0
 
         if self.self_refine_iterations < 1:
             raise ValueError("self_refine_iterations must be at least 1")
         if not 0.0 <= self.self_refine_certain_percentage <= 1.0:
             raise ValueError("self_refine_certain_percentage must be in [0, 1]")
+        if self.self_refine_strategy not in {"legacy", "semantic"}:
+            raise ValueError(
+                "self_refine_strategy must be either 'legacy' or 'semantic'"
+            )
+        if not 0.0 <= self.self_refine_edit_quantile <= 1.0:
+            raise ValueError("self_refine_edit_quantile must be in [0, 1]")
+        for name, value in (
+            ("self_refine_dynamic_strength", self.self_refine_dynamic_strength),
+            ("self_refine_edit_strength", self.self_refine_edit_strength),
+            ("self_refine_exploration_strength", self.self_refine_exploration_strength),
+            ("self_refine_source_anchor_strength", self.self_refine_source_anchor_strength),
+            ("self_refine_mask_momentum", self.self_refine_mask_momentum),
+            ("self_refine_temporal_smoothing", self.self_refine_temporal_smoothing),
+            ("self_refine_acceptance_margin", self.self_refine_acceptance_margin),
+        ):
+            if not 0.0 <= value <= 1.0:
+                raise ValueError(f"{name} must be in [0, 1]")
+        if self.self_refine_mask_temperature <= 0:
+            raise ValueError("self_refine_mask_temperature must be positive")
+        if self.self_refine_acceptance_mode not in {"preserve_edit", "none"}:
+            raise ValueError(
+                "self_refine_acceptance_mode must be either 'preserve_edit' or 'none'"
+            )
         invalid_self_refine_steps = [
             step for step in self.self_refine_steps
             if step < 0 or step >= len(self.denoising_step_list) - 1
@@ -133,7 +195,8 @@ class CausalInferencePipeline(torch.nn.Module):
                 "Self-refining P&P enabled: "
                 f"steps={sorted(self.self_refine_steps)}, "
                 f"iterations={self.self_refine_iterations}, "
-                f"uncertainty_threshold={self.self_refine_uncertainty_threshold}"
+                f"uncertainty_threshold={self.self_refine_uncertainty_threshold}, "
+                f"strategy={self.self_refine_strategy}"
             )
             if self.use_internal_pruning:
                 print(
@@ -279,6 +342,101 @@ class CausalInferencePipeline(torch.nn.Module):
         low_importance_mask = self._compute_mask_from_importance(importance)
         
         return low_importance_mask
+
+    @staticmethod
+    def _normalize_self_refine_map(value):
+        """Normalize each frame's spatial map to [0, 1]."""
+        flat = value.float().flatten(-2)
+        minimum = flat.amin(dim=-1, keepdim=True)
+        maximum = flat.amax(dim=-1, keepdim=True)
+        span = maximum - minimum
+        normalized = (flat - minimum) / (span + 1e-6)
+        # A nearly constant map contains no reliable localization signal.
+        normalized = torch.where(
+            span > 1e-5,
+            normalized,
+            torch.zeros_like(normalized),
+        )
+        return normalized.reshape_as(value).to(dtype=value.dtype)
+
+    def _soft_quantile_self_refine_mask(self, value, quantile):
+        """Turn a per-frame score map into a soft top-(1-quantile) mask."""
+        normalized = self._normalize_self_refine_map(value)
+        flat = normalized.float().flatten(-2)
+        threshold = torch.quantile(flat, quantile, dim=-1, keepdim=True)
+        temperature = max(self.self_refine_mask_temperature, 1e-4)
+        mask = torch.sigmoid((flat - threshold) / temperature)
+        return mask.reshape_as(value).to(dtype=value.dtype)
+
+    @staticmethod
+    def _temporal_smooth_self_refine_mask(mask):
+        """Suppress frame-to-frame mask flicker without an external model."""
+        if mask.shape[1] < 3:
+            return mask
+        # Replicate the edge frame instead of zero-padding it; zero padding
+        # would artificially weaken edits at the beginning/end of each chunk.
+        padded = nnf.pad(
+            mask.unsqueeze(1),
+            (0, 0, 0, 0, 1, 1),
+            mode="replicate",
+        )
+        return nnf.avg_pool3d(
+            padded,
+            kernel_size=(3, 1, 1),
+            stride=1,
+        ).squeeze(1)
+
+    def _build_semantic_self_refine_masks(
+        self,
+        refined_pred,
+        source_latent,
+        uncertainty,
+        previous_edit_mask=None,
+        previous_dynamic_mask=None,
+    ):
+        """Build source-aware edit and uncertainty gates for one P&P iteration.
+
+        The source-vs-prediction latent delta is an internal proxy for the region
+        being edited.  It is deliberately computed from tensors already present
+        in the I2V pipeline; no segmentation model, CLIP, attention hook, or
+        additional learned component is used.
+        """
+        if source_latent is None:
+            edit_mask = torch.zeros_like(uncertainty)
+        else:
+            source_delta = (refined_pred - source_latent).pow(2).mean(dim=2)
+            edit_mask = self._soft_quantile_self_refine_mask(
+                source_delta,
+                self.self_refine_edit_quantile,
+            )
+
+        uncertainty_norm = self._normalize_self_refine_map(uncertainty)
+        if self.self_refine_uncertainty_threshold > 0:
+            temperature = max(self.self_refine_mask_temperature, 1e-4)
+            dynamic_mask = torch.sigmoid(
+                (uncertainty_norm - self.self_refine_uncertainty_threshold)
+                / temperature
+            )
+        else:
+            dynamic_mask = torch.ones_like(uncertainty_norm)
+
+        if previous_edit_mask is not None:
+            momentum = self.self_refine_mask_momentum
+            edit_mask = momentum * previous_edit_mask + (1.0 - momentum) * edit_mask
+            dynamic_mask = momentum * previous_dynamic_mask + (1.0 - momentum) * dynamic_mask
+
+        smoothing = self.self_refine_temporal_smoothing
+        if smoothing > 0:
+            edit_mask = (
+                smoothing * self._temporal_smooth_self_refine_mask(edit_mask)
+                + (1.0 - smoothing) * edit_mask
+            )
+            dynamic_mask = (
+                smoothing * self._temporal_smooth_self_refine_mask(dynamic_mask)
+                + (1.0 - smoothing) * dynamic_mask
+            )
+
+        return edit_mask.clamp(0, 1), dynamic_mask.clamp(0, 1)
     
     def save_mask_video(self, output_path, prompt=""):
         """
@@ -578,7 +736,12 @@ class CausalInferencePipeline(torch.nn.Module):
                     # seed-matched ablations meaningful.
                     if self.use_self_refine and index in self.self_refine_steps:
                         refined_pred = denoised_pred
-                        certain_mask = None
+
+                        # The semantic branch carries mask state across the three
+                        # P&P re-evaluations.  This prevents each fresh noise draw
+                        # from producing an unrelated spatial decision.
+                        previous_edit_mask = None
+                        previous_dynamic_mask = None
 
                         for refine_index in range(self.self_refine_iterations):
                             refine_noise = torch.randn(
@@ -608,36 +771,121 @@ class CausalInferencePipeline(torch.nn.Module):
                             )
 
                             uncertainty = (new_pred - refined_pred).abs().mean(dim=2)
-                            threshold = self.self_refine_uncertainty_threshold
 
-                            if threshold > 0:
-                                current_certain = uncertainty < threshold
-                                certain_mask = (
-                                    current_certain
-                                    if certain_mask is None
-                                    else (certain_mask | current_certain)
-                                )
-                                certain_mask_5d = certain_mask.unsqueeze(2)
-                                refined_pred = torch.where(
-                                    certain_mask_5d, refined_pred, new_pred
-                                )
-                                certain_ratio = certain_mask.float().mean().item()
-                            else:
-                                refined_pred = new_pred
-                                certain_ratio = 0.0
+                            if self.self_refine_strategy == "legacy":
+                                threshold = self.self_refine_uncertainty_threshold
+                                if threshold > 0:
+                                    current_certain = uncertainty < threshold
+                                    # Match the original implementation: once a
+                                    # location is certain, keep its earlier value.
+                                    if refine_index == 0:
+                                        certain_mask = current_certain
+                                    else:
+                                        certain_mask = certain_mask | current_certain
+                                    refined_pred = torch.where(
+                                        certain_mask.unsqueeze(2),
+                                        refined_pred,
+                                        new_pred,
+                                    )
+                                    certain_ratio = certain_mask.float().mean().item()
+                                else:
+                                    refined_pred = new_pred
+                                    certain_ratio = 0.0
 
-                            print(
-                                f"[Self-Refine][Chunk {frame_idx}][Step {index}] "
-                                f"iteration={refine_index + 1}/{self.self_refine_iterations}, "
-                                f"mean_uncertainty={uncertainty.mean().item():.6f}, "
-                                f"certain_ratio={certain_ratio:.4f}"
+                                print(
+                                    f"[Self-Refine][Chunk {frame_idx}][Step {index}] "
+                                    f"iteration={refine_index + 1}/{self.self_refine_iterations}, "
+                                    f"mean_uncertainty={uncertainty.mean().item():.6f}, "
+                                    f"certain_ratio={certain_ratio:.4f}"
+                                )
+
+                                if (
+                                    threshold > 0
+                                    and certain_ratio > self.self_refine_certain_percentage
+                                ):
+                                    break
+                                continue
+
+                            edit_mask, dynamic_mask = self._build_semantic_self_refine_masks(
+                                refined_pred=refined_pred,
+                                source_latent=y_input,
+                                uncertainty=uncertainty,
+                                previous_edit_mask=previous_edit_mask,
+                                previous_dynamic_mask=previous_dynamic_mask,
+                            )
+                            previous_edit_mask = edit_mask.detach()
+                            previous_dynamic_mask = dynamic_mask.detach()
+
+                            # Edit areas get the strongest P&P update.  Uncertain
+                            # non-edit areas still receive a smaller exploratory
+                            # update so that an edit that is not yet visible in
+                            # the latent is not permanently masked out.
+                            edit_gate = self.self_refine_edit_strength * edit_mask
+                            dynamic_gate = (
+                                self.self_refine_dynamic_strength
+                                * dynamic_mask
+                                * (1.0 - edit_mask)
+                            )
+                            exploration_gate = (
+                                self.self_refine_exploration_strength
+                                * (1.0 - edit_mask)
+                            )
+                            update_gate = (
+                                edit_gate + dynamic_gate + exploration_gate
+                            ).clamp(0, 1)
+
+                            candidate = refined_pred + update_gate.unsqueeze(2) * (
+                                new_pred - refined_pred
                             )
 
+                            # Internal acceptance rule: do not let a refinement
+                            # erase the source-to-target latent displacement in
+                            # a region already identified as edited.
+                            preserve_ratio = 1.0
                             if (
-                                threshold > 0
-                                and certain_ratio > self.self_refine_certain_percentage
+                                y_input is not None
+                                and self.self_refine_acceptance_mode == "preserve_edit"
                             ):
-                                break
+                                base_delta = (refined_pred - y_input).pow(2).mean(dim=2)
+                                candidate_delta = (candidate - y_input).pow(2).mean(dim=2)
+                                required_delta = base_delta * (
+                                    1.0 - self.self_refine_acceptance_margin
+                                )
+                                preserve = (
+                                    (edit_mask < 0.5)
+                                    | (candidate_delta >= required_delta)
+                                )
+                                preserve_ratio = preserve.float().mean().item()
+                                candidate = torch.where(
+                                    preserve.unsqueeze(2),
+                                    candidate,
+                                    refined_pred,
+                                )
+
+                            # A weak source anchor stabilizes background regions;
+                            # it is deliberately applied after acceptance and only
+                            # where the latent delta says the edit is absent.
+                            if (
+                                y_input is not None
+                                and self.self_refine_source_anchor_strength > 0
+                            ):
+                                keep_gate = 1.0 - edit_mask
+                                candidate = candidate + (
+                                    self.self_refine_source_anchor_strength
+                                    * keep_gate.unsqueeze(2)
+                                    * (y_input - candidate)
+                                )
+
+                            refined_pred = candidate
+                            print(
+                                f"[Self-Refine][Semantic][Chunk {frame_idx}][Step {index}] "
+                                f"iteration={refine_index + 1}/{self.self_refine_iterations}, "
+                                f"mean_uncertainty={uncertainty.mean().item():.6f}, "
+                                f"edit_ratio={edit_mask.mean().item():.4f}, "
+                                f"dynamic_ratio={dynamic_mask.mean().item():.4f}, "
+                                f"update_ratio={update_gate.mean().item():.4f}, "
+                                f"preserve_ratio={preserve_ratio:.4f}"
+                            )
 
                         denoised_pred = refined_pred
 

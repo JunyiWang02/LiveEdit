@@ -52,18 +52,37 @@ num_frames: 81
 model_kwargs:
   timestep_shift: 5.0
 
-# Self-refining ablation: run one fixed-noise-level P&P update at t=750.
-# Index 1 is the second item in denoising_step_list. The first/last steps are
-# intentionally left unchanged so layout formation and final details remain stable.
+# Training-free semantic Self-Refine. P&P is still executed at the selected
+# denoising indices, but its update is source-aware and region-gated.
+# Index 1 is the second item in denoising_step_list. The server setting can use
+# [1, 2] and three iterations without changing the implementation.
+# Set self_refine_strategy to ``legacy`` to reproduce the original whole-region
+# uncertainty replacement for a seed-matched ablation.
 use_self_refine: true
-self_refine_steps: [1]
-self_refine_iterations: 1
+self_refine_strategy: semantic
+self_refine_steps: [1, 2]
+self_refine_iterations: 3
 
-# 0.0 means full-region refinement, matching the paper's I2V-style setting.
-# After the first ablation, try 0.1/0.2 if non-edited regions drift.
-self_refine_uncertainty_threshold: 0.0
+# In semantic mode uncertainty is normalized per frame before thresholding.
+# 0.25 keeps refinement active in uncertain regions while avoiding a hard
+# whole-frame replacement.
+self_refine_uncertainty_threshold: 0.25
+# Used only by the legacy branch; semantic mode runs all requested iterations.
 self_refine_certain_percentage: 0.999
 self_refine_seed: 1000003
+
+# Inference-only controls; all masks come from existing source/prediction
+# latents, so no segmentation, CLIP, attention hook, or extra model is needed.
+self_refine_edit_quantile: 0.70
+self_refine_edit_strength: 1.0
+self_refine_dynamic_strength: 0.65
+self_refine_exploration_strength: 0.10
+self_refine_source_anchor_strength: 0.08
+self_refine_mask_momentum: 0.70
+self_refine_temporal_smoothing: 0.50
+self_refine_mask_temperature: 0.10
+self_refine_acceptance_mode: preserve_edit
+self_refine_acceptance_margin: 0.05
 
 wandb_host: https://api.wandb.ai
 wandb_key: WANDB_KEY
